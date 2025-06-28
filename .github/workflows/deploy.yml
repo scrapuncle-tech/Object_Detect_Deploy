@@ -1,0 +1,47 @@
+name: Deploy Python Model to AWS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy Python Model to AWS
+        uses: appleboy/ssh-action@master
+        with:
+          host: 13.201.39.170
+          username: ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            BASE_DIR="/home/ubuntu/Object_Detect_Deploy"
+
+            echo "Navigating to base directory"
+            cd $BASE_DIR
+
+            echo "Stashing and pulling latest code"
+            git stash
+            git pull origin main
+
+            echo "Checking for virtual environment..."
+            if [ ! -d "venv" ]; then
+              echo "Creating virtual environment..."
+              python3 -m venv venv
+            fi
+
+            echo "Activating virtual environment"
+            source venv/bin/activate
+
+            echo "Upgrading pip"
+            pip install --upgrade pip
+
+            echo "Installing Python dependencies"
+            pip install -r requirements.txt
+
+            echo "Restarting Python API with PM2"
+            pm2 restart object
+
+            echo "Deployment completed!"
