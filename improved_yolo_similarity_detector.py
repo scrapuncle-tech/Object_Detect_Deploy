@@ -62,7 +62,7 @@ class ImprovedYOLOSimilarityDetector:
         self.used_warehouse_objects = set()
     
     def create_output_directories(self):
-        """Create directories for saving similar objects"""
+        """Create directories for saving similar objects and unmatched flagged images"""
         base_path = Path(self.output_folder)
         base_path.mkdir(exist_ok=True)
         
@@ -71,6 +71,11 @@ class ImprovedYOLOSimilarityDetector:
         (base_path / "warehouse_matches").mkdir(exist_ok=True)
         (base_path / "combined_matches").mkdir(exist_ok=True)
         (base_path / "reports").mkdir(exist_ok=True)
+        
+        # Create flag directory for unmatched images
+        (base_path / "flag").mkdir(exist_ok=True)
+        (base_path / "flag" / "pickup_unmatched").mkdir(exist_ok=True)
+        (base_path / "flag" / "warehouse_unmatched").mkdir(exist_ok=True)
         
         logger.info(f"Output directories created at: {base_path}")
     
@@ -541,6 +546,144 @@ class ImprovedYOLOSimilarityDetector:
         
         logger.info(f"✅ Saved all matches and reports to {self.output_folder}")
     
+    def flag_unmatched_images(self, matches: List[Dict]) -> Dict:
+        """Flag and save images that don't have matches"""
+        logger.info("🏁 Flagging unmatched images...")
+        
+        flag_dir = Path(self.output_folder) / "flag"
+        pickup_flag_dir = flag_dir / "pickup_unmatched"
+        warehouse_flag_dir = flag_dir / "warehouse_unmatched"
+        
+        # Track matched image paths
+        matched_pickup_paths = set()
+        matched_warehouse_paths = set()
+        
+        for match in matches:
+            matched_pickup_paths.add(match['pickup_object']['image_path'])
+            matched_warehouse_paths.add(match['warehouse_object']['image_path'])
+        
+        # Find unmatched pickup images
+        unmatched_pickup = []
+        for obj in self.pickup_objects:
+            if obj['image_path'] not in matched_pickup_paths:
+                unmatched_pickup.append(obj)
+                # Copy original image to flag directory
+                src_path = obj['image_path']
+                dest_filename = f"unmatched_pickup_{obj['image_name']}"
+                dest_path = pickup_flag_dir / dest_filename
+                try:
+                    shutil.copy2(src_path, dest_path)
+                    logger.info(f"Flagged unmatched pickup image: {obj['image_name']}")
+                except Exception as e:
+                    logger.error(f"Failed to copy {src_path} to flag directory: {e}")
+        
+        # Find unmatched warehouse images
+        unmatched_warehouse = []
+        for obj in self.warehouse_objects:
+            if obj['image_path'] not in matched_warehouse_paths:
+                unmatched_warehouse.append(obj)
+                # Copy original image to flag directory
+                src_path = obj['image_path']
+                dest_filename = f"unmatched_warehouse_{obj['image_name']}"
+                dest_path = warehouse_flag_dir / dest_filename
+                try:
+                    shutil.copy2(src_path, dest_path)
+                    logger.info(f"Flagged unmatched warehouse image: {obj['image_name']}")
+                except Exception as e:
+                    logger.error(f"Failed to copy {src_path} to flag directory: {e}")
+        
+        # Create unmatched report
+        unmatched_report = {
+            'timestamp': datetime.now().isoformat(),
+            'summary': {
+                'total_pickup_images': len(self.pickup_objects),
+                'total_warehouse_images': len(self.warehouse_objects),
+                'matched_pickup_images': len(matched_pickup_paths),
+                'matched_warehouse_images': len(matched_warehouse_paths),
+                'unmatched_pickup_images': len(unmatched_pickup),
+                'unmatched_warehouse_images': len(unmatched_warehouse),
+                'total_matches_found': len(matches)
+            },
+            'unmatched_pickup_details': [
+                {
+                    'image_name': obj['image_name'],
+                    'image_path': obj['image_path'],
+                    'detected_class': obj['class'],
+                    'confidence': obj['confidence'],
+                    'flagged_copy_path': str(pickup_flag_dir / f"unmatched_pickup_{obj['image_name']}")
+                }
+                for obj in unmatched_pickup
+            ],
+            'unmatched_warehouse_details': [
+                {
+                    'image_name': obj['image_name'],
+                    'image_path': obj['image_path'],
+                    'detected_class': obj['class'],
+                    'confidence': obj['confidence'],
+                    'flagged_copy_path': str(warehouse_flag_dir / f"unmatched_warehouse_{obj['image_name']}")
+                }
+                for obj in unmatched_warehouse
+            ]
+        }
+        
+        # Save unmatched report
+        reports_dir = Path(self.output_folder) / "reports"
+        unmatched_report_path = reports_dir / "unmatched_images_report.json"
+        with open(unmatched_report_path, 'w') as f:
+            json.dump(unmatched_report, f, indent=2)
+        
+        logger.info(f"🏁 Unmatched images report:")
+        logger.info(f"   - Unmatched pickup images: {len(unmatched_pickup)}")
+        logger.info(f"   - Unmatched warehouse images: {len(unmatched_warehouse)}")
+        logger.info(f"   - Flagged images saved to: {flag_dir}")
+        logger.info(f"   - Report saved to: {unmatched_report_path}")
+        
+        return unmatched_report
+    
+    def serialize_matches(self, matches: List[Dict]) -> List[Dict]:
+        """Convert matches to JSON-serializable format by removing numpy arrays and OpenCV objects"""
+        serialized_matches = []
+        
+        for match in matches:
+            pickup_obj = match['pickup_object']
+            warehouse_obj = match['warehouse_object']
+            
+            # Create clean objects without numpy arrays or OpenCV objects
+            clean_pickup = {
+                'id': pickup_obj['id'],
+                'bbox': [int(x) for x in pickup_obj['bbox']],  # Convert to list of ints
+                'confidence': float(pickup_obj['confidence']),
+                'class': pickup_obj['class'],
+                'image_path': pickup_obj['image_path'],
+                'image_name': pickup_obj['image_name'],
+                'folder_type': pickup_obj['folder_type'],
+                'area': int(pickup_obj['area'])
+            }
+            
+            clean_warehouse = {
+                'id': warehouse_obj['id'],
+                'bbox': [int(x) for x in warehouse_obj['bbox']],  # Convert to list of ints
+                'confidence': float(warehouse_obj['confidence']),
+                'class': warehouse_obj['class'],
+                'image_path': warehouse_obj['image_path'],
+                'image_name': warehouse_obj['image_name'],
+                'folder_type': warehouse_obj['folder_type'],
+                'area': int(warehouse_obj['area'])
+            }
+            
+            serialized_match = {
+                'pickup_object': clean_pickup,
+                'warehouse_object': clean_warehouse,
+                'similarity_score': float(match['similarity_score']),
+                'raw_similarity': float(match['raw_similarity']),
+                'class_match': bool(match['class_match']),
+                'match_id': match['match_id']
+            }
+            
+            serialized_matches.append(serialized_match)
+        
+        return serialized_matches
+    
     def create_enhanced_combined_image(self, pickup_obj, warehouse_obj, match):
         """Create an enhanced combined image with detailed information"""
         # Resize both ROIs to same height
@@ -595,11 +738,37 @@ class ImprovedYOLOSimilarityDetector:
             
             if not self.pickup_objects:
                 logger.error("No non-living main objects detected in pickup folder")
-                return
+                # Still flag unmatched images even if no pickup objects
+                if self.warehouse_objects:
+                    unmatched_report = self.flag_unmatched_images([])
+                    return {
+                        'matches': [],
+                        'unmatched_report': unmatched_report,
+                        'summary': {
+                            'total_matches': 0,
+                            'pickup_objects': 0,
+                            'warehouse_objects': len(self.warehouse_objects),
+                            'average_similarity': 0.0,
+                            'similarity_threshold': float(self.similarity_threshold)
+                        }
+                    }
+                return {'error': 'No objects detected in pickup folder'}
             
             if not self.warehouse_objects:
                 logger.error("No non-living main objects detected in warehouse folder")
-                return
+                # Flag unmatched pickup images
+                unmatched_report = self.flag_unmatched_images([])
+                return {
+                    'matches': [],
+                    'unmatched_report': unmatched_report,
+                    'summary': {
+                        'total_matches': 0,
+                        'pickup_objects': len(self.pickup_objects),
+                        'warehouse_objects': 0,
+                        'average_similarity': 0.0,
+                        'similarity_threshold': float(self.similarity_threshold)
+                    }
+                }
             
             # Step 3: Compute enhanced features
             self.compute_features_for_objects(self.pickup_objects)
@@ -611,10 +780,25 @@ class ImprovedYOLOSimilarityDetector:
             if not self.similar_matches:
                 logger.warning(f"No similar objects found above threshold {self.similarity_threshold}")
                 logger.info("Try lowering the similarity threshold or check if objects are truly similar")
-                return
+                # Still flag unmatched images even if no matches found
+                unmatched_report = self.flag_unmatched_images([])
+                return {
+                    'matches': [],
+                    'unmatched_report': unmatched_report,
+                    'summary': {
+                        'total_matches': 0,
+                        'pickup_objects': len(self.pickup_objects),
+                        'warehouse_objects': len(self.warehouse_objects),
+                        'average_similarity': 0.0,
+                        'similarity_threshold': float(self.similarity_threshold)
+                    }
+                }
             
             # Step 5: Save results
             self.save_similar_objects(self.similar_matches)
+            
+            # Step 6: Flag unmatched images
+            unmatched_report = self.flag_unmatched_images(self.similar_matches)
             
             # Print detailed summary
             logger.info("="*70)
@@ -622,12 +806,15 @@ class ImprovedYOLOSimilarityDetector:
             logger.info(f"📊 Pickup main objects detected: {len(self.pickup_objects)}")
             logger.info(f"📊 Warehouse main objects detected: {len(self.warehouse_objects)}")
             logger.info(f"📊 Similar matches found: {len(self.similar_matches)}")
+            logger.info(f"📊 Unmatched pickup images: {unmatched_report['summary']['unmatched_pickup_images']}")
+            logger.info(f"📊 Unmatched warehouse images: {unmatched_report['summary']['unmatched_warehouse_images']}")
             logger.info(f"📊 Class matches: {sum(1 for m in self.similar_matches if m['class_match'])}")
             logger.info(f"📊 Similarity threshold: {self.similarity_threshold}")
             if self.similar_matches:
                 avg_sim = np.mean([m['similarity_score'] for m in self.similar_matches])
                 logger.info(f"📊 Average similarity: {avg_sim:.3f}")
             logger.info(f"📁 Results saved to: {self.output_folder}")
+            logger.info(f"🏁 Flagged unmatched images saved to: {self.output_folder}/flag/")
             logger.info("="*70)
             
             # Print individual matches
@@ -638,6 +825,20 @@ class ImprovedYOLOSimilarityDetector:
                 logger.info(f"  {i}. {pickup_obj['image_name']} ({pickup_obj['class']}) ↔ "
                            f"{warehouse_obj['image_name']} ({warehouse_obj['class']}) "
                            f"- Similarity: {match['similarity_score']:.3f}")
+            
+            # Return comprehensive results for API (JSON-serializable)
+            return {
+                'matches': self.serialize_matches(self.similar_matches),
+                'unmatched_report': unmatched_report,
+                'summary': {
+                    'total_matches': len(self.similar_matches),
+                    'pickup_objects': len(self.pickup_objects),
+                    'warehouse_objects': len(self.warehouse_objects),
+                    'average_similarity': float(np.mean([m['similarity_score'] for m in self.similar_matches])) if self.similar_matches else 0.0,
+                    'similarity_threshold': float(self.similarity_threshold),
+                    'class_matches': sum(1 for m in self.similar_matches if m['class_match'])
+                }
+            }
             
         except Exception as e:
             logger.error(f"❌ Similarity detection failed: {e}")

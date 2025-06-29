@@ -197,27 +197,96 @@ async def detect_similarity_upload(
                 output_folder=str(output_folder)
             )
             detector.similarity_threshold = similarity_threshold
-            detector.run_similarity_detection()
+            result = detector.run_similarity_detection()
 
-            # Load the latest report
+            # Check if detection returned results
+            if isinstance(result, dict) and 'error' in result:
+                raise HTTPException(status_code=400, detail=result['error'])
+
+            # Load additional reports for backward compatibility
             report_dir = output_folder / "reports"
-            json_files = list(report_dir.glob("similarity_report_*.json"))
-            if not json_files:
-                raise HTTPException(status_code=500, detail="No report generated")
-            latest_report = max(json_files, key=os.path.getctime)
-            with open(latest_report, 'r') as f:
-                report_data = json.load(f)
+            summary_file = report_dir / "summary.json"
+            unmatched_file = report_dir / "unmatched_images_report.json"
+            
+            summary_data = {}
+            if summary_file.exists():
+                with open(summary_file, 'r') as f:
+                    summary_data = json.load(f)
 
-            return {
+            # Construct comprehensive response
+            response = {
                 "status": "success",
                 "message": "Similarity detection completed",
                 "run_id": run_id,
-                "report": report_data,
-                "download_instructions": "Use GET /download-match-image/{run_id}/{match_id}/{image_type} with image_type as 'pickup', 'warehouse', or 'combined'"
+                "summary": result.get('summary', summary_data),
+                "matches": result.get('matches', []),
+                "unmatched_report": result.get('unmatched_report', {}),
+                "download_instructions": {
+                    "matched_images": "Use GET /download-match-image/{run_id}/{match_id}/{image_type} with image_type as 'pickup', 'warehouse', or 'combined'",
+                    "unmatched_images": "Use GET /download-unmatched-image/{run_id}/{image_type}/{filename} with image_type as 'pickup' or 'warehouse'",
+                    "reports": {
+                        "summary_json": "GET /download-summary/{run_id}",
+                        "unmatched_json": "GET /download-unmatched-json/{run_id}",
+                        "similarity_json": "GET /download-similarity-report/{run_id}",
+                        "all_reports_zip": "GET /download-all-reports/{run_id}"
+                    }
+                }
             }
+
+            return response
 
     except Exception as e:
         logger.error(f"Error during similarity detection: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/unmatched-report/{run_id}", summary="Get unmatched images report for a specific run")
+async def get_unmatched_report(run_id: str):
+    """
+    Get the detailed unmatched images report for a specific run_id.
+    """
+    try:
+        report_dir = OUTPUT_BASE_DIR / run_id / "reports"
+        unmatched_file = report_dir / "unmatched_images_report.json"
+        
+        if not unmatched_file.exists():
+            raise HTTPException(status_code=404, detail=f"Unmatched report not found for run {run_id}")
+        
+        with open(unmatched_file, 'r') as f:
+            unmatched_data = json.load(f)
+        
+        return {
+            "status": "success",
+            "run_id": run_id,
+            "unmatched_report": unmatched_data
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting unmatched report: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/download-unmatched-image/{run_id}/{image_type}/{filename}", summary="Download a specific unmatched flagged image")
+async def download_unmatched_image(run_id: str, image_type: str, filename: str):
+    """
+    Download an unmatched flagged image using run_id, image_type, and filename.
+    image_type: 'pickup' or 'warehouse'.
+    """
+    try:
+        base_dir = OUTPUT_BASE_DIR / run_id / "flag"
+        if image_type == "pickup":
+            dir_path = base_dir / "pickup_unmatched"
+        elif image_type == "warehouse":
+            dir_path = base_dir / "warehouse_unmatched"
+        else:
+            raise HTTPException(status_code=400, detail="Invalid image_type. Use 'pickup' or 'warehouse'")
+
+        image_path = dir_path / filename
+        if not image_path.exists():
+            raise HTTPException(status_code=404, detail=f"Unmatched {image_type} image '{filename}' not found in run {run_id}")
+
+        return FileResponse(image_path, media_type="image/jpeg", filename=filename)
+
+    except Exception as e:
+        logger.error(f"Error downloading unmatched image: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.get("/download-match-image/{run_id}/{match_id}/{image_type}", summary="Download a specific match image")
@@ -245,6 +314,120 @@ async def download_match_image(run_id: str, match_id: str, image_type: str):
 
     except Exception as e:
         logger.error(f"Error downloading image: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/download-summary/{run_id}", summary="Download summary.json file")
+async def download_summary_json(run_id: str):
+    """
+    Download the summary.json file for a specific run_id.
+    """
+    try:
+        report_dir = OUTPUT_BASE_DIR / run_id / "reports"
+        summary_file = report_dir / "summary.json"
+        
+        if not summary_file.exists():
+            raise HTTPException(status_code=404, detail=f"Summary file not found for run {run_id}")
+        
+        return FileResponse(
+            summary_file, 
+            media_type="application/json", 
+            filename=f"summary_{run_id}.json"
+        )
+
+    except Exception as e:
+        logger.error(f"Error downloading summary file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/download-unmatched-json/{run_id}", summary="Download unmatched_images_report.json file")
+async def download_unmatched_report_json(run_id: str):
+    """
+    Download the unmatched_images_report.json file for a specific run_id.
+    """
+    try:
+        report_dir = OUTPUT_BASE_DIR / run_id / "reports"
+        unmatched_file = report_dir / "unmatched_images_report.json"
+        
+        if not unmatched_file.exists():
+            raise HTTPException(status_code=404, detail=f"Unmatched report file not found for run {run_id}")
+        
+        return FileResponse(
+            unmatched_file, 
+            media_type="application/json", 
+            filename=f"unmatched_report_{run_id}.json"
+        )
+
+    except Exception as e:
+        logger.error(f"Error downloading unmatched report file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/download-similarity-report/{run_id}", summary="Download similarity_report.json file")
+async def download_similarity_report_json(run_id: str):
+    """
+    Download the similarity_report_{timestamp}.json file for a specific run_id.
+    """
+    try:
+        report_dir = OUTPUT_BASE_DIR / run_id / "reports"
+        
+        # Find the similarity report file (has timestamp in filename)
+        similarity_files = list(report_dir.glob("similarity_report_*.json"))
+        if not similarity_files:
+            raise HTTPException(status_code=404, detail=f"Similarity report file not found for run {run_id}")
+        
+        # Get the most recent similarity report if multiple exist
+        latest_similarity_file = max(similarity_files, key=os.path.getctime)
+        
+        return FileResponse(
+            latest_similarity_file, 
+            media_type="application/json", 
+            filename=f"similarity_report_{run_id}.json"
+        )
+
+    except Exception as e:
+        logger.error(f"Error downloading similarity report file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/download-all-reports/{run_id}", summary="Download all report files as ZIP")
+async def download_all_reports_zip(run_id: str):
+    """
+    Download all report files (summary.json, unmatched_images_report.json, similarity_report.json) as a ZIP file.
+    """
+    try:
+        import zipfile
+        from io import BytesIO
+        
+        report_dir = OUTPUT_BASE_DIR / run_id / "reports"
+        if not report_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Reports directory not found for run {run_id}")
+        
+        # Create a temporary ZIP file
+        import tempfile
+        temp_zip_path = tempfile.mktemp(suffix='.zip')
+        
+        with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # Add summary.json if it exists
+            summary_file = report_dir / "summary.json"
+            if summary_file.exists():
+                zip_file.write(summary_file, "summary.json")
+            
+            # Add unmatched report if it exists
+            unmatched_file = report_dir / "unmatched_images_report.json"
+            if unmatched_file.exists():
+                zip_file.write(unmatched_file, "unmatched_images_report.json")
+            
+            # Add similarity report if it exists
+            similarity_files = list(report_dir.glob("similarity_report_*.json"))
+            if similarity_files:
+                latest_similarity_file = max(similarity_files, key=os.path.getctime)
+                zip_file.write(latest_similarity_file, f"similarity_report.json")
+        
+        return FileResponse(
+            temp_zip_path,
+            media_type="application/zip",
+            filename=f"reports_{run_id}.zip"
+        )
+
+    except Exception as e:
+        logger.error(f"Error creating reports ZIP: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 if __name__ == "__main__":
