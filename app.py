@@ -12,6 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 import requests
 import gdown  # For Google Drive downloads
+import zipfile
 
 # Import the detector class (assumed to be in the same directory)
 from improved_yolo_similarity_detector import ImprovedYOLOSimilarityDetector
@@ -430,6 +431,367 @@ async def download_all_reports_zip(run_id: str):
         logger.error(f"Error creating reports ZIP: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
+def download_image_from_url(image_url: str, save_path: str) -> bool:
+    """Download an image from URL and save it to the specified path"""
+    try:
+        logger.info(f"Downloading image from {image_url}")
+        response = requests.get(image_url, stream=True, timeout=30)
+        response.raise_for_status()
+        
+        # Check if response contains image data
+        content_type = response.headers.get('content-type', '')
+        if not content_type.startswith('image/'):
+            logger.warning(f"URL does not appear to contain an image: {content_type}")
+        
+        with open(save_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        
+        logger.info(f"✅ Successfully downloaded image to {save_path}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to download image from {image_url}: {e}")
+        return False
+
+def process_json_images(json_data: dict, temp_dir: str, prefix: str) -> bool:
+    """Process JSON data to download images from URLs using product ID as filename"""
+    try:
+        images = json_data.get('images', [])
+        product_id = json_data.get('product', {}).get('id', 'unknown_product')
+        
+        if not images:
+            logger.warning(f"No images found in JSON data for {prefix}")
+            return False
+        
+        success_count = 0
+        for i, image_url in enumerate(images):
+            # Use product ID and index for filename
+            filename = f"{product_id}_{i}.jpg"
+            file_path = os.path.join(temp_dir, filename)
+            
+            if download_image_from_url(image_url, file_path):
+                success_count += 1
+            else:
+                logger.error(f"Failed to download image {i} for product {product_id}")
+        
+        if success_count > 0:
+            logger.info(f"✅ Successfully downloaded {success_count}/{len(images)} images for {prefix} (product: {product_id})")
+            return True
+        else:
+            logger.error(f"❌ Failed to download any images for {prefix} (product: {product_id})")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error processing JSON images for {prefix}: {str(e)}")
+        return False
+
+@app.post("/process-json-images/", summary="Process JSON file and download images")
+async def process_json_images_endpoint(
+    json_file: UploadFile = File(..., description="JSON file containing image URLs"),
+    prefix: str = Form(..., description="Prefix for output files")
+):
+    """
+    Process a JSON file containing image URLs and download the images to a temporary directory.
+    Returns the list of downloaded image file paths.
+    """
+    try:
+        # Validate and save the uploaded JSON file
+        if not json_file.filename.endswith('.json'):
+            raise HTTPException(status_code=400, detail="Uploaded file is not a JSON file")
+        
+        # Create a temporary directory for this upload
+        with tempfile.TemporaryDirectory(dir=TEMP_DIR) as temp_dir:
+            # Save the uploaded JSON file
+            json_path = Path(temp_dir) / json_file.filename
+            with open(json_path, "wb") as f:
+                shutil.copyfileobj(json_file.file, f)
+            
+            # Load JSON data
+            with open(json_path, 'r') as f:
+                json_data = json.load(f)
+            
+            # Download images specified in the JSON data
+            success = process_json_images(json_data, temp_dir, prefix)
+            
+            if not success:
+                raise HTTPException(status_code=500, detail="Failed to download images from JSON data")
+            
+            # Collect downloaded image file paths
+            downloaded_files = [str(Path(temp_dir) / f) for f in os.listdir(temp_dir) if f.endswith('.jpg')]
+            
+            return {
+                "status": "success",
+                "message": "Images processed and downloaded",
+                "downloaded_files": downloaded_files
+            }
+
+    except Exception as e:
+        logger.error(f"Error processing JSON images: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.post("/detect-similarity-json/", summary="Run similarity detection with JSON files containing image URLs")
+async def detect_similarity_json(
+    pickup_json: UploadFile = File(..., description="JSON file with pickup data containing image URLs"),
+    warehouse_json: UploadFile = File(..., description="JSON file with warehouse data containing image URLs"),
+    similarity_threshold: float = Form(0.75, description="Threshold for similarity detection (0.0 to 1.0)")
+):
+    """
+    Upload JSON files containing image URLs for pickup and warehouse to detect similar non-living objects.
+    The JSON files should contain 'images' array with URLs and 'product' object with 'id'.
+    Returns a JSON report and a run_id to download matched images.
+    """
+    try:
+        # Validate JSON file types
+        if not pickup_json.filename.lower().endswith('.json'):
+            raise HTTPException(status_code=400, detail="Pickup file must be a JSON file")
+        if not warehouse_json.filename.lower().endswith('.json'):
+            raise HTTPException(status_code=400, detail="Warehouse file must be a JSON file")
+        
+        # Generate unique run_id
+        run_id = str(uuid.uuid4())
+        output_folder = OUTPUT_BASE_DIR / run_id
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        # Create temporary directories for downloaded images
+        with tempfile.TemporaryDirectory(dir=TEMP_DIR) as temp_pickup_dir, \
+             tempfile.TemporaryDirectory(dir=TEMP_DIR) as temp_warehouse_dir:
+
+            # Read and parse pickup JSON
+            try:
+                pickup_content = await pickup_json.read()
+                pickup_data = json.loads(pickup_content.decode('utf-8'))
+                logger.info(f"Loaded pickup JSON with product ID: {pickup_data.get('product', {}).get('id', 'unknown')}")
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid pickup JSON format: {str(e)}")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error reading pickup JSON: {str(e)}")
+
+            # Read and parse warehouse JSON
+            try:
+                warehouse_content = await warehouse_json.read()
+                warehouse_data = json.loads(warehouse_content.decode('utf-8'))
+                logger.info(f"Loaded warehouse JSON with product ID: {warehouse_data.get('product', {}).get('id', 'unknown')}")
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid warehouse JSON format: {str(e)}")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error reading warehouse JSON: {str(e)}")
+
+            # Download pickup images from URLs
+            pickup_success = process_json_images(pickup_data, temp_pickup_dir, "pickup")
+            if not pickup_success:
+                raise HTTPException(status_code=400, detail="Failed to download pickup images from URLs")
+
+            # Download warehouse images from URLs  
+            warehouse_success = process_json_images(warehouse_data, temp_warehouse_dir, "warehouse")
+            if not warehouse_success:
+                raise HTTPException(status_code=400, detail="Failed to download warehouse images from URLs")
+
+            # Check if we have any images to process
+            pickup_images = list(Path(temp_pickup_dir).glob("*.jpg"))
+            warehouse_images = list(Path(temp_warehouse_dir).glob("*.jpg"))
+            
+            if not pickup_images:
+                raise HTTPException(status_code=400, detail="No pickup images were successfully downloaded")
+            if not warehouse_images:
+                raise HTTPException(status_code=400, detail="No warehouse images were successfully downloaded")
+
+            logger.info(f"Processing {len(pickup_images)} pickup images and {len(warehouse_images)} warehouse images")
+
+            # Initialize and run detector
+            detector = ImprovedYOLOSimilarityDetector(
+                pickup_folder=temp_pickup_dir,
+                warehouse_folder=temp_warehouse_dir,
+                output_folder=str(output_folder)
+            )
+            detector.similarity_threshold = similarity_threshold
+            result = detector.run_similarity_detection()
+
+            # Check if detection returned results
+            if isinstance(result, dict) and 'error' in result:
+                raise HTTPException(status_code=400, detail=result['error'])
+
+            # Load additional reports for backward compatibility
+            report_dir = output_folder / "reports"
+            summary_file = report_dir / "summary.json"
+            unmatched_file = report_dir / "unmatched_images_report.json"
+            
+            summary_data = {}
+            if summary_file.exists():
+                with open(summary_file, 'r') as f:
+                    summary_data = json.load(f)
+
+            # Construct comprehensive response with product information
+            response = {
+                "status": "success",
+                "message": "Similarity detection completed using JSON image URLs",
+                "run_id": run_id,
+                "pickup_product": {
+                    "id": pickup_data.get('product', {}).get('id', 'unknown'),
+                    "name": pickup_data.get('product', {}).get('name', 'unknown'),
+                    "images_processed": len(pickup_images)
+                },
+                "warehouse_product": {
+                    "id": warehouse_data.get('product', {}).get('id', 'unknown'),
+                    "name": warehouse_data.get('product', {}).get('name', 'unknown'),
+                    "images_processed": len(warehouse_images)
+                },
+                "summary": result.get('summary', summary_data),
+                "matches": result.get('matches', []),
+                "unmatched_report": result.get('unmatched_report', {}),
+                "download_instructions": {
+                    "matched_images": "Use GET /download-match-image/{run_id}/{match_id}/{image_type} with image_type as 'pickup', 'warehouse', or 'combined'",
+                    "unmatched_images": "Use GET /download-unmatched-image/{run_id}/{image_type}/{filename} with image_type as 'pickup' or 'warehouse'",
+                    "reports": {
+                        "summary_json": "GET /download-summary/{run_id}",
+                        "unmatched_json": "GET /download-unmatched-json/{run_id}",
+                        "similarity_json": "GET /download-similarity-report/{run_id}",
+                        "all_reports_zip": "GET /download-all-reports/{run_id}"
+                    }
+                }
+            }
+
+            return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during JSON-based similarity detection: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.post("/detect-similarity-from-files/", summary="Run similarity detection using local JSON files")
+async def detect_similarity_from_files(
+    pickup_json_path: str = Form(..., description="Path to pickup JSON file (e.g., 'pick.json')"),
+    warehouse_json_path: str = Form(..., description="Path to warehouse JSON file (e.g., 'ware.json')"),
+    similarity_threshold: float = Form(0.75, description="Threshold for similarity detection (0.0 to 1.0)")
+):
+    """
+    Use local JSON files containing image URLs for pickup and warehouse to detect similar non-living objects.
+    The JSON files should contain 'images' array with URLs and 'product' object with 'id'.
+    """
+    try:
+        # Validate that JSON files exist
+        pickup_path = Path(pickup_json_path)
+        warehouse_path = Path(warehouse_json_path)
+        
+        if not pickup_path.exists():
+            raise HTTPException(status_code=404, detail=f"Pickup JSON file not found: {pickup_json_path}")
+        if not warehouse_path.exists():
+            raise HTTPException(status_code=404, detail=f"Warehouse JSON file not found: {warehouse_json_path}")
+        
+        # Generate unique run_id
+        run_id = str(uuid.uuid4())
+        output_folder = OUTPUT_BASE_DIR / run_id
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        # Create temporary directories for downloaded images
+        with tempfile.TemporaryDirectory(dir=TEMP_DIR) as temp_pickup_dir, \
+             tempfile.TemporaryDirectory(dir=TEMP_DIR) as temp_warehouse_dir:
+
+            # Read and parse pickup JSON
+            try:
+                with open(pickup_path, 'r', encoding='utf-8') as f:
+                    pickup_data = json.load(f)
+                logger.info(f"Loaded pickup JSON from {pickup_json_path} with product ID: {pickup_data.get('product', {}).get('id', 'unknown')}")
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid pickup JSON format in {pickup_json_path}: {str(e)}")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error reading pickup JSON from {pickup_json_path}: {str(e)}")
+
+            # Read and parse warehouse JSON
+            try:
+                with open(warehouse_path, 'r', encoding='utf-8') as f:
+                    warehouse_data = json.load(f)
+                logger.info(f"Loaded warehouse JSON from {warehouse_json_path} with product ID: {warehouse_data.get('product', {}).get('id', 'unknown')}")
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid warehouse JSON format in {warehouse_json_path}: {str(e)}")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error reading warehouse JSON from {warehouse_json_path}: {str(e)}")
+
+            # Download pickup images from URLs
+            pickup_success = process_json_images(pickup_data, temp_pickup_dir, "pickup")
+            if not pickup_success:
+                raise HTTPException(status_code=400, detail="Failed to download pickup images from URLs")
+
+            # Download warehouse images from URLs  
+            warehouse_success = process_json_images(warehouse_data, temp_warehouse_dir, "warehouse")
+            if not warehouse_success:
+                raise HTTPException(status_code=400, detail="Failed to download warehouse images from URLs")
+
+            # Check if we have any images to process
+            pickup_images = list(Path(temp_pickup_dir).glob("*.jpg"))
+            warehouse_images = list(Path(temp_warehouse_dir).glob("*.jpg"))
+            
+            if not pickup_images:
+                raise HTTPException(status_code=400, detail="No pickup images were successfully downloaded")
+            if not warehouse_images:
+                raise HTTPException(status_code=400, detail="No warehouse images were successfully downloaded")
+
+            logger.info(f"Processing {len(pickup_images)} pickup images and {len(warehouse_images)} warehouse images")
+
+            # Initialize and run detector
+            detector = ImprovedYOLOSimilarityDetector(
+                pickup_folder=temp_pickup_dir,
+                warehouse_folder=temp_warehouse_dir,
+                output_folder=str(output_folder)
+            )
+            detector.similarity_threshold = similarity_threshold
+            result = detector.run_similarity_detection()
+
+            # Check if detection returned results
+            if isinstance(result, dict) and 'error' in result:
+                raise HTTPException(status_code=400, detail=result['error'])
+
+            # Load additional reports for backward compatibility
+            report_dir = output_folder / "reports"
+            summary_file = report_dir / "summary.json"
+            
+            summary_data = {}
+            if summary_file.exists():
+                with open(summary_file, 'r') as f:
+                    summary_data = json.load(f)
+
+            # Construct comprehensive response with product information
+            response = {
+                "status": "success",
+                "message": "Similarity detection completed using local JSON files",
+                "run_id": run_id,
+                "pickup_product": {
+                    "id": pickup_data.get('product', {}).get('id', 'unknown'),
+                    "name": pickup_data.get('product', {}).get('name', 'unknown'),
+                    "images_processed": len(pickup_images),
+                    "source_file": pickup_json_path
+                },
+                "warehouse_product": {
+                    "id": warehouse_data.get('product', {}).get('id', 'unknown'),
+                    "name": warehouse_data.get('product', {}).get('name', 'unknown'),
+                    "images_processed": len(warehouse_images),
+                    "source_file": warehouse_json_path
+                },
+                "summary": result.get('summary', summary_data),
+                "matches": result.get('matches', []),
+                "unmatched_report": result.get('unmatched_report', {}),
+                "download_instructions": {
+                    "matched_images": "Use GET /download-match-image/{run_id}/{match_id}/{image_type} with image_type as 'pickup', 'warehouse', or 'combined'",
+                    "unmatched_images": "Use GET /download-unmatched-image/{run_id}/{image_type}/{filename} with image_type as 'pickup' or 'warehouse'",
+                    "reports": {
+                        "summary_json": "GET /download-summary/{run_id}",
+                        "unmatched_json": "GET /download-unmatched-json/{run_id}",
+                        "similarity_json": "GET /download-similarity-report/{run_id}",
+                        "all_reports_zip": "GET /download-all-reports/{run_id}"
+                    }
+                }
+            }
+
+            return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during file-based similarity detection: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8001)

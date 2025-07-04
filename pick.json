@@ -1,0 +1,23 @@
+{
+  "createdAt": "2025-05-24",
+  "geolocation": {
+    "accuracy": 17.656999588012695,
+    "latitude": 28.5152545,
+    "longitude": 77.272717,
+    "timestamp": 1748028708103
+  },
+  "id": "0000d93d-88f7-40f3-9843-5b08077dbf30",
+  "images": [
+    "https://firebasestorage.googleapis.com/v0/b/scrapuncle-452708.firebasestorage.app/o/itemImages%2Fbcd548ff-eece-419f-9c31-c629350d4af3%2F8448679665%2F0000d93d-88f7-40f3-9843-5b08077dbf30%2F1748028708376_0.jpg?alt=media&token=e76a1f28-7648-4cca-abcd-cb939c2074bb"
+  ],
+  "pickupId": "bcd548ff-eece-419f-9c31-c629350d4af3",
+  "product": {
+    "id": "fDj9sYsLAgIIUZkTeCHy",
+    "name": "Fully Automatic Washing Machine (Front Load)",
+    "price": 44,
+    "unit": "weight"
+  },
+  "supervisorPhoneNumber": "8448679665",
+  "totalPrice": 2384.8,
+  "weight": 54.2
+}
